@@ -1,0 +1,419 @@
+
+
+
+setwd("C:/Users/jason/OneDrive/Desktop/2022-05-21 WB ML Analysis")
+
+
+packages <- c("tidyverse", "qualtRics", "egg", "patchwork", "tidyLPA", "psych", 
+              "mice", "mclust", "reshape2", "ggplot2", "psych", "GPArotation",
+              "caTools", "readxl", "e1071", "randomForest", "neuralnet")
+lapply(packages, function(packages) {
+  if (!require(packages, character.only = T)) {
+    install.packages(packages)
+    require(packages)
+  }
+})
+
+rm(packages)
+
+df <- read.csv(file = "2022-05-21 WB Data n = 10608.csv", header = TRUE) # load data.
+
+################################################################################
+# Data cleaning
+
+# fixing any random missingness issues.
+df[df == ""] <- NA 
+df[df == -99] <- NA 
+df[df == "NA"] <- NA
+df[df == "na"] <- NA
+df[df == -88] <- NA
+df[df == -.99] <- NA
+
+# removing strings vars.
+string.vars <- df %>% select_if(~!is.numeric(.x)) %>% colnames() # this will find all the string columns. 
+df <- df[!(colnames(df) %in% string.vars)] # remove all string.vars in the df. 
+
+# checking out the Whistleblower variable.
+
+#df$H5 %>% unique() # H5 = 1 yes, 2 no, and NA's.
+#df$H5 %>% table()
+#df$H5 %>% is.na() %>% sum(., na.rm = TRUE) 
+
+# In total we have 1631 employees who reported wrongdoing, 960 said No, 8017 NAs.
+
+# Recoding/renaming the DV variable.
+df$dv <- df$H5
+df <- dplyr::select(df, -H5) # droping original dv item. 
+
+df$dv[df$dv == 1] <- 1 # WB yes = 1
+df$dv[df$dv == 2] <- 0 # WB no = 0
+
+rm(string.vars)
+
+################################################################################
+# Step 1: Data Cleaning.
+
+# Missingness correlations testing.
+
+# Testing for a relationship between WB behaviour and missingness on the other vars.
+# logic being that we don't want the models to predict WB behaviours based on survey
+# branch logic or missingness on values. 
+
+df.missing <- df # new temp df.
+
+WB <- df.missing$dv # saving out the WB variable.
+df.missing <- dplyr::select(df.missing, -dv) # dropping original dv item. 
+
+df.missing[is.na(df.missing)] <- 9999 # replace all missing 9999.
+
+df.missing[df.missing < 9999] <- 0 # set all < 9999 = 0.
+
+df.missing[df.missing == 9999] <- 1 # set all 9999 = 1. 
+
+# Add the WB var back in.
+df.missing$WB <- WB
+
+df.missing$WB.na <- ifelse(is.na(df.missing$WB), 1, 0) # 1 if WB = na.
+df.missing$WB.yes <- ifelse(df.missing$WB == 1, 1, 0) # 1 if WB = yes.
+df.missing$WB.yes[is.na(df.missing$WB.yes)] <- 0 # set NA's to 0 also.
+df.missing$WB.no <- ifelse(df.missing$WB == 0, 1, 0) # 1 if WB = no.
+df.missing$WB.no[is.na(df.missing$WB.no)] <- 0 # set Na's to 0.
+
+cor.table <- cor(df.missing) # correlate all vars.
+
+WB.cor <- as.data.frame(cor.table[,c("WB","WB.na","WB.yes","WB.no")]) # gives only dv cols.
+WB.cor <- WB.cor^2 # square to remove negative.
+#write.csv(round(WB.cor, 2), file = "delete01.csv") # inspected out of interest, only need yes/no.
+
+delete.1 <- subset(WB.cor, WB.cor$WB.yes > .16) %>% rownames() # give all items where missingness cor > .4 with WB.yes.
+delete.2 <- subset(WB.cor, WB.cor$WB.no > .16) %>% rownames() # give all items where missingness cor > .4 with WB.no.
+
+drop.vars <- unique(c(delete.1, delete.2))
+
+df <- df %>% dplyr::select(-one_of(drop.vars)) # drop vars.
+
+rm(WB, WB.cor, cor.table, df.missing, delete.1, delete.2, drop.vars)
+# so these will be the items not included in the other analysis, being missing on any of
+# these is related to either yes or no responses on WB item (above r = .40). 
+
+# Absolute missingness testing.
+# checking vars for missingness.
+missing.percent <- as.data.frame(apply(df, 2, function(x){sum(is.na(x))/length(x)*100})) # Missing% per column (2 = col, 1 = row).
+
+# some vars still have 100% missing, will remove these
+missing.percent <- missing.percent %>% subset(missing.percent[,1] < 80)
+
+df <- df[,row.names(missing.percent)] # keep only vars in miss.per (i.e., < 80% missing)
+
+df <- df %>% subset(!is.na(df$dv)) # removing NAs from the WB var.
+# after cleaning we have 2591 rows across 918 variables.
+
+rm(missing.percent)
+
+# Removing no variance items.
+
+low.var <- as.data.frame(apply(df, 2, function(x){max(x[!is.na(x)])-min(x[!is.na(x)])}))
+
+low.var <- low.var %>% subset(low.var[,1] > .001) # remove all variables w/ no variance.
+
+df <- df[,row.names(low.var)]
+# after cleaning we have 2591 rows across 905 variables.
+
+##### test for collinearity between all vars (MICE doesn't like too much collinearity).
+
+collinear.vars <- mice:::find.collinear(df) # 241 items found to be collinear, will drops these.
+
+#collinear.vars <- collinear.vars %>% subset(collinear.vars != "dv") # remove dv from this drop list.
+df.dv <- df$dv # saving out dv.
+
+df <- df %>% dplyr::select(-one_of(collinear.vars)) # drop vars.
+# after cleaning we have 2591 rows across 664 variables.
+
+# still finding high corr vars, will manually remove these here.
+cor.table <- cor(df, use = "pairwise.complete.obs") # correlate all vars.
+diag(cor.table) <- 0
+cor.table <- cor.table ^2 # remove negative corrs.
+cor.vars <- as.data.frame(apply(cor.table, 2, function(x){max(x[!is.na(x)])}))
+
+cor.vars <- cor.vars %>% subset(cor.vars[,1] < .90)
+
+df <- df[,row.names(cor.vars)] # keep only vars with corr's less than .95.
+# after cleaning we have 2591 rows across 570 variables.
+
+rm(cor.vars, cor.table)
+
+##### Rerunning missingness from above but with a 50% cut-off.
+
+missing.percent <- as.data.frame(apply(df, 2, function(x){sum(is.na(x))/length(x)*100})) # Missing% per column (2 = col, 1 = row).
+missing.percent <- missing.percent %>% subset(missing.percent[,1] < 50) 
+df <- df[,row.names(missing.percent)] # keep only vars in miss.per (i.e., < 50% missing)
+# after cleaning we have 2591 rows across 425 variables.
+
+##### Testing for correlations with the DV.
+
+df$dv <- df.dv # add this dv back in.
+cor.table <- cor(df, use = "pairwise.complete.obs") # correlate all vars.
+diag(cor.table) <- 0
+dv.cor <- cor.table[,'dv'] # grab dv column.
+
+rm(cor.table)
+
+dv.cor <- dv.cor ^2 # remove negative corrs.
+cor.vars <- dv.cor %>% subset(dv.cor < .09) # removes all that corr > .30.
+
+df <- df[, names(cor.vars)] # keep only cols in cor.vars.
+# after cleaning we have 2591 rows across 404 variables.
+
+##### Removing huge factor variables.
+
+# read that MI cant really handle large factor variables (i.e., with many unique responses)
+unique.values <- as.data.frame(apply(df, 2, function(x){n_distinct(x)})) 
+unique.values$sd <- apply(df, 2, function(x){round(sd(x, na.rm = TRUE),2)})
+unique.values <- unique.values %>% subset(sd < 2.5) # keep only vars with < 2.5 sd.
+
+df <- df[,row.names(unique.values)] # remove vars w/ > 2.5 sd.
+# after cleaning we have 2591 rows across 393 variables.
+
+unique.values$meth <- ifelse(unique.values[,1] == 2, "logreg", "norm") # use these below.
+# need to define imputation for dummy and likert variables.
+meth <- unique.values$meth
+
+################################################################################
+##### Step 2: Imputation.
+# need to define the method (meth) and the prediction Matrix (predM) used in the
+
+# need to define imputation for dummy and likert variables.
+meth <- unique.values$meth
+names(meth) <- c(row.names(unique.values)) # add name labels to the vector.
+
+init <- mice(df, maxit = 0, seed = 4045) # initiate an empty MICE object.
+predM <- init$predictorMatrix
+
+#predM[, c("var_name")]=0  # this code will tell MICE to impute this var but not use it in the MI calculations (neat).
+
+rm(collinear.vars, dummy.vars, normal.vars, low.var, missing.percent)
+#https://stats.stackexchange.com/questions/209811/how-to-improve-running-time-for-r-mice-data-imputation
+#https://rpubs.com/kaz_yos/mice-exclude
+#https://stats.stackexchange.com/questions/209811/how-to-improve-running-time-for-r-mice-data-imputation
+
+
+imputed.data <- mice(df, m =5, maxit = 3, method = meth,  predictorMatrix=predM, 
+                     remove.collinear=FALSE, seed = 4046, nnet.MaxNWts = 2000) # MaxNWts increases iterations.
+
+df.imputed <- complete(imputed.data)
+
+#write.csv(df.imputed, file = "Imputed File v.394.csv") # save out df so I dont have to re-impute.
+#df <- read.csv(file = "Imputed File v.394.csv", header = TRUE)
+
+df$dv <- as.factor(df.dv)
+
+
+################################################################################
+# Test train split.
+
+set.seed(723738834)
+
+sample <- caTools::sample.split(df$dv, .80)
+train.df <- df %>% subset(sample == TRUE)
+test.df <- df %>% subset(sample == FALSE)
+
+test.df.dv <- test.df$dv 
+test.df <- test.df %>% select(-one_of(c("dv")))
+
+###########################################################################
+##### Logistic Regression #####.
+
+log.model <- glm(dv ~ ., family = binomial(link = 'logit'), data = train.df)
+summary(log.model) # might try to retrain models deleting vars which are non-sig.
+
+log.predictions <- predict(log.model, test.df, type = 'response') #'response' is used for classification.
+# need to convert the probability outputs to 0 or 1. 
+log.binary.values <- ifelse(log.predictions > .5, 1, 0)
+
+# log.misclass.error <- mean(log.binary.values != test.df$dv)
+# print(1 - log.misclass.error)
+
+log.table <- table(log.binary.values, test.df.dv)
+print(log.table)
+#a 83% accuracy for the log model.
+
+###########################################################################
+##### SVM Model #####.
+
+svm.model <- svm(as.factor(train.df$dv) ~ ., data = train.df, type = "C", kernel = 'radial')
+summary(svm.model)
+
+svm.predicted.values <- predict(svm.model, test.df)
+
+svm.table <- table(svm.predicted.values, test.df.dv)
+
+# syntax to check SVM parameter weights.
+#svm.weights <- t(svm.model$coefs) %*% svm.model$SV # weight vectors
+#svm.weights <- apply(svm.weights, 2, function(v){sqrt(sum(v^2))})  # weight
+#svm.weights <- sort(svm.weights, decreasing = T)
+#print(head(svm.weights))
+
+# Time to tune the cost and gamma values. 
+
+tuned.train.df <- tune(svm, train.x = dv ~ ., data = train.df,
+                      kernel = 'radial', type = 'C', ranges = list(cost = c(.1, .5, 1, 1.5, 2), 
+                                                                   gamma = c(.001, .005, .01, .05, .10)))
+# print(tuned.train.df)
+# 
+tuned.model <- svm(dv ~ ., data = train.df, type = "C", 
+                    cost = tuned.train.df$best.parameters[1], 
+                    gamma = tuned.train.df$best.parameters[2])
+ 
+tuned.predictions <- predict(tuned.model, test.df)
+svm.table <- table(tuned.predictions, test.df.dv)
+# 
+# print(svm.table)
+
+##########################################################################
+##### Random Forest Model #####.
+
+# Does a random forest model perform better?
+# need to set these as factors or RF trys to use regression.
+train.df$dv <- as.factor(train.df$dv)
+test.df$dv <- as.factor(test.df$dv)
+
+rf.model <- randomForest(dv ~ ., data = train.df, ntree = 100, importance = TRUE) # Importance using GINI impurity index values. 
+
+# For checking parameters.
+#rf.model$confusion
+#rf.model$importance
+
+rf.predictions <- predict(rf.model, test.df)
+
+rf.table <- table(rf.predictions, test.df.dv)
+
+print(rf.table)
+#a Random Forrest model accuracy is 91%, so better than the log model.
+
+###########################################################################
+##### Neural Network #####.
+
+#df$dv <- df.dv # need to set the DV back to numeric (not factor)
+
+train.df.dv <- train.df$dv # save out dv.
+
+train.df <- train.df %>% dplyr::select(-one_of("dv")) # drop vars.
+train.df <- as.data.frame(scale(train.df))
+train.df$dv <- as.numeric(train.df.dv) # i didn't want the dv to be scaled.
+
+
+nn.formula <- as.formula(paste("dv ~", paste(
+  subset(colnames(df), colnames(df) != "dv"), collapse = " + ")))
+
+nn <- neuralnet(nn.formula,
+                 data = df,
+                 hidden = c(10,10),
+                 linear.output = FALSE, #set linear.output to FALSE for classification.
+                 err.fct = "ce", 
+                 likelihood = TRUE, 
+                 threshold = .1) # failed to converge @ .01 default.
+
+# plot(nn,col.hidden = 'darkgreen',     
+#      col.hidden.synapse = 'darkgreen',
+#      show.weights = F,
+#      information = F,
+#      fill = 'lightblue')
+
+
+predicted.nn.values <- neuralnet::compute(nn, test.df)
+nn.predicted.test.values <- predicted.nn.values$net.result
+
+# for more info see http://uc-r.github.io/ann_classification 
+# need to convert the probability outputs to 0 or 1. 
+nn.binary.values <- c(rep(0, nrow(nn.predicted.test.values)))
+for (i in 1:nrow(nn.predicted.test.values)) {
+  if (nn.predicted.test.values[i] > .5) {
+    nn.binary.values[i] <- TRUE
+  } else nn.binary.values[i] <- FALSE
+}
+
+nn.table <- table(nn.binary.values, test.df.dv)
+print(nn.table)
+
+#plot(nn)
+
+length(test.df.dv[test.df.dv == 1])
+
+###########################################################################
+##### Plotting Classifiers Outcomes #####.
+# first need to calculate the accuracy was guessing (given training data sample descriptives)
+# population rates = 63%
+pop.rate <- (length(train.df$dv[train.df$dv == 1]))/(nrow(train.df)/100) #best guess is 63% positive rate in test set. 
+pop.rate.test <- (length(test.df.dv[test.df.dv == 1]))/(length(test.df.dv)/100) #best guess is 63% positive rate in test set. 
+
+
+guessing.true.pos <- round(((nrow(test.df)/100) * (pop.rate/100) * pop.rate), 0) # Best guess in test data.
+guessing.true.neg <- round(((nrow(test.df)/100) * ((100 - pop.rate)/100) * (100 - pop.rate)), 0) # guessed negative.
+guessing.error.rate <- round(((length(test.df.dv[test.df.dv == 1])) - guessing.true.pos), 0) # error rates (note these are equal for both type I and type II)
+
+# creating a confusion matrix of correct/false classifications.
+
+con.matrices <- data.frame(cbind(log.table, rf.table, svm.table, nn.table))
+colnames(con.matrices) <- c('log F', 'log T', 'rf F', 'rf T', 'svm F', 'svm T', 'nn F', 'nn T')
+rownames(con.matrices) <- c('False', 'True')
+
+correct.class.cm <- data.frame(cbind(c(log.table[1,1], log.table[2,2], (log.table[1,2] + log.table[2,1])), 
+                                     c(rf.table[1,1], rf.table[2,2], (rf.table[1,2] + rf.table[2,1])),
+                                     c(svm.table[1,1], svm.table[2,2], (svm.table[1,2] + svm.table[2,1])), 
+                                     c(nn.table[1,1], nn.table[2,2], (nn.table[1,2] + nn.table[2,1]))))
+colnames(correct.class.cm) <- c('log', 'rf', 'svm', 'nn')
+rownames(correct.class.cm) <- c('False', 'True', 'Error')
+
+# note: the factor labels below tell ggplot to order them in this order.
+ml.method <- c(rep('Logistic Regression' , 3), rep('Random Forest' , 3), 
+               rep('Support Vector Machine', 3) , rep('Neural Network', 3), rep('Guessing', 3))
+ml.method <- factor(ml.method, levels = c(
+  'Logistic Regression', 'Random Forest', 'Support Vector Machine', 'Neural Network', 'Guessing'))
+condition <- rep(c('True Positive' , 'True Negative' , 'Type II Error'), 5)
+condition <- factor(condition, levels = c('True Positive', 'True Negative', 'Type II Error'))
+values <- c(correct.class.cm[2,1], correct.class.cm[1,1], correct.class.cm[3,1], 
+            correct.class.cm[2,2], correct.class.cm[1,2], correct.class.cm[3,2],
+            correct.class.cm[2,3], correct.class.cm[1,3], correct.class.cm[3,3],
+            correct.class.cm[2,4], correct.class.cm[1,4], correct.class.cm[3,4],
+            guessing.true.pos, guessing.true.neg, (guessing.error.rate * 2))
+
+bar.graph.df <- data.frame(ml.method, condition, values)
+
+# creating an error graph to demonstrate type I vs II errors.
+error.ml.method <- c(rep('Logistic Regression' , 2), rep('Random Forest' , 2), 
+                     rep('Support Vector Machine' , 2), rep('Neural Network', 2))
+error.ml.method <- factor(error.ml.method, levels = c(
+  'Logistic Regression', 'Random Forest', 'Support Vector Machine', 'Neural Network'))
+error.type <- rep(c('False Negative' , 'False Positive'), 4)
+error.type <- factor(error.type, levels = c('False Positive', 'False Negative'))
+error.values <- c(con.matrices[2,1], con.matrices[1,2],
+                  con.matrices[2,3], con.matrices[1,4],
+                  con.matrices[2,5], con.matrices[1,6],
+                  con.matrices[2,7], con.matrices[1,8])
+error.graph.df <- data.frame(error.ml.method, error.type, error.values)
+
+##### Time to GGPlot #####.
+
+ggplot(bar.graph.df, aes(fill=condition, y=values, x=ml.method)) + 
+  geom_bar(position="dodge", stat="identity", color = 'black') + theme_bw() + 
+  scale_fill_manual(values = c('dark red', 'red', 'dark grey', 'light grey')) + 
+  xlab("") + ylab('WB Rates (n = 518)') +
+  labs(fill = '') +  scale_y_continuous(expand = c(0, 0), limits = c(0, 500)) + 
+  geom_text(aes(label = paste0(round(values/((NROW(test.df)/100)),0), "%")), 
+            position = position_dodge(width = 1), vjust = -.5, size = 3) +
+  geom_rect(data= bar.graph.df, mapping=aes(
+    xmin=1.15, xmax=1.45, ymin=0, 
+    ymax=con.matrices[2,1], fill= 'Type I Error'), color="black", alpha=0.5) +
+  geom_rect(data= bar.graph.df, mapping=aes(
+    xmin=2.15, xmax=2.45, ymin=0, 
+    ymax=con.matrices[2,3], fill= 'Type I Error'), color="black", alpha=0.5) +
+  geom_rect(data= bar.graph.df, mapping=aes(
+    xmin=3.15, xmax=3.45, ymin=0, 
+    ymax=con.matrices[2,5], fill= 'Type I Error'), color="black", alpha=0.5) +
+  geom_rect(data= bar.graph.df, mapping=aes(
+    xmin=4.15, xmax=4.45, ymin=0, 
+    ymax=con.matrices[2,7], fill= 'Type I Error'), color="black", alpha=0.5) +
+  geom_rect(data= bar.graph.df, mapping=aes(
+    xmin=5.15, xmax=5.45, ymin=0, 
+    ymax=(guessing.error.rate/2), fill= 'Type I Error'), color="black", alpha=0.5)
+
